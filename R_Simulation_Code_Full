@@ -1,0 +1,1018 @@
+###########################################################################
+###                                                                     ###
+###             csmGmm: An R Package for Large-Scale                    ###
+###             Composite Null Hypothesis Testing                       ###
+###                                                                     ###
+###########################################################################
+
+# Section 2.1: Figure 2 (Hypothesis Plot) --------------------------------------
+
+# install.packages(c("ggplot2", "dplyr", "tidyr"))
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+hypotheses <- expand.grid(UKBB = c(-1,0,1),
+                          MVP   = c(-1,0,1)) %>%
+  mutate(HypothesisID = row_number())
+
+hypotheses_long <- hypotheses %>%
+  pivot_longer(cols = c(UKBB, MVP),
+               names_to = "Study",
+               values_to = "Effect") %>%
+  mutate(Sign = case_when(
+    Effect == 1 ~ "+",
+    Effect == -1 ~ "-",
+    TRUE ~ " "
+  ))
+
+blank_rows <- hypotheses_long %>% filter(Sign == " ") %>% pull(HypothesisID)
+opposite_rows <- hypotheses %>% filter((UKBB == 1 & MVP == -1) | (UKBB == -1 & MVP == 1)) %>% pull(HypothesisID)
+
+combined <- hypotheses_long
+combined$Study <- factor(combined$Study, levels = c("UKBB","MVP"))
+
+top_row <- data.frame(
+  Study = "Configuration ID",
+  HypothesisID = 1:9,
+  Sign = as.character(1:9)
+)
+
+ggplot() +
+  geom_tile(data = combined,
+            aes(y = Study,
+                x = factor(HypothesisID, levels = 1:9),
+                fill = case_when(
+                  HypothesisID %in% blank_rows ~ "blank",
+                  HypothesisID %in% opposite_rows ~ "opposite",
+                  TRUE ~ "normal"
+                )),
+            color = "black") +
+  geom_text(data = combined,
+            aes(y = Study,
+                x = factor(HypothesisID, levels = 1:9),
+                label = Sign),
+            size = 5, vjust = 0.5, hjust = 0.5) +
+  geom_text(data = top_row,
+            aes(y = Study, x = factor(HypothesisID, levels = 1:9), label = Sign),
+            size = 5, vjust = 0.5, hjust = 0.5) +
+  scale_fill_manual(values = c("blank" = "plum", "opposite" = "pink", "normal" = "white"),
+                    guide = "none") +
+  scale_x_discrete(expand = c(0,0)) +
+  coord_fixed(ratio = 1.2, clip = "off") +
+  labs(x = "", y = "") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(size = 14),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+###########################################################################
+###                                                                     ###
+###                   Fig 4: Simulation Code                            ###
+###                                                                     ###
+###########################################################################
+
+# Section 3.4: Figure 4 (False Discovery and Power Curves) ---------------------
+
+# install.packages("ggplot2")
+library(ggplot2)
+
+#' symm_fit_ind_fixed()
+#'
+#' Fit the conditionally symmetric multidimensional Gaussian mixture model for sets of independent elements
+#'
+#' @param testStats J*K matrix of test statistics where J is the number of sets and K is number of elements in each set.
+#'
+#'
+#' @return A list with the elements:
+#' \item{fixedPi}{Vector of fixed pi values with length 3^K, holds the final mean parameters.}
+#' \item{fixedMu}{Vector of fixed mu values with length K, holds final mixture proportions.}
+#' \item{lfdrResults}{J*1 vector of all lfdr statistics.}
+#' \item{Hmat}{Dataframe of all configurations including bl, sl, l, symAlt}
+#' \item{probZ}{Vector of length J. For each row of testStats, the total probability (likelihood) under all configurations.}
+#' \item{probNull}{Vector of length J. For each row of testStats, the total probability under the null configurations (configurations with at least one zero component in hl).}
+
+#' @importFrom dplyr %>% mutate arrange filter select slice relocate
+#' @import utils
+#' @export
+#' @examples
+#' set.seed(0)
+#' testStats <- rbind(null_stats, alt_1, alt_2, alt_3)
+#' null_stats <- generate_alt_stats(900, fixedMu, pi, hl = c(0, 0))
+#' alt_1 <- generate_alt_stats(40, fixedMu, pi, hl = c(1, 0)) 
+#' alt_2 <- generate_alt_stats(30, fixedMu, pi, hl = c(0, 1)) 
+#' alt_3 <- generate_alt_stats(30, fixedMu, pi, hl = c(1, 1)) 
+#' fixedPi_3 <- c(0.9, 0.04, 0.03, 0.03)
+#' fixedPi_90 <- c(0.03, 0.03, 0.04, 0.9)
+#' fixedPi_40 <- c(0.4, 0.1, 0.1, 0.4)
+#' fixedMu <- c(2, 2)
+#' mu_values <- seq(0, 12, by = 0.25)
+#' fixedMu <- rep(mu_val, 2)  : repeats scalar twice (e.g. when mu_values = 1, fixedMu = c(1,1))
+#' results <- symm_fit_ind_fixed(testStats = testStats, fixedMu = fixedMu, fixedPi = fixedPi)
+
+
+calc_dens_ind_hl <- function(Zmat, mu, pi, hl) {
+  N <- nrow(Zmat)
+  K <- ncol(Zmat)
+  
+  dens <- rep(1, N)
+  
+  for (j in 1:K) {
+    dens_j <- if (hl[j] == 0) {
+      dnorm(Zmat[,j], mean = 0, sd = 1)
+    } else {
+      pi * dnorm(Zmat[,j], mean = mu[j], sd = 1) +
+        (1 - pi) * dnorm(Zmat[,j], mean = -mu[j], sd = 1)
+    }
+    
+    dens <- dens * dens_j
+  }
+  
+  return(dens)
+}
+
+library(dplyr)
+
+symm_fit_ind_fixed <- function(testStats, fixedMu, fixedPi) {
+  
+  # number of composite null hypotheses
+  J <- nrow(testStats)
+  # number of dimensions
+  K <- ncol(testStats)
+  B <- 2^K - 1
+  # number of hl configurations (excluding global null)
+  L <- 3^K - 1
+  
+  # Only include the hl patterns that are actually used
+  Hmat <- as.data.frame(matrix(c(
+    0, 0,
+    1, 0,
+    0, 1,
+    1, 1
+  ), byrow = TRUE, ncol = K))
+  
+  # Precompute all densities
+  densMat <- sapply(1:nrow(Hmat), function(idx) {
+    # Extract h^l for this configuration
+    hl_vec <- as.numeric(Hmat[idx, 1:K]) #Hmat[idx, ] gives one h^l configuration
+    
+    # For this problem, fixedPi is vector of 4 probabilities → grouped by pattern (regardless of signs)
+    #fixedPi[idx] gives prior probability assigned to that particular h^l configuration
+    calc_dens_ind_hl(testStats, fixedMu, fixedPi[idx], hl_vec)
+  })
+  
+  # Enumerate all 9 signed configurations
+  allHmat <- as.data.frame(expand.grid(c(-1, 0, 1), c(-1, 0, 1)))
+  
+  # Get the pattern index (row index of Hmat) for each signed config using abs()
+  patternIndices <- apply(allHmat, 1, function(row) {
+    match(paste0(abs(row), collapse=""), apply(Hmat, 1, function(x) paste0(x, collapse="")))
+  })
+  
+  # Count how many signed configs belong to each pattern
+  patternCounts <- table(patternIndices)
+  
+  # Reweight fixedPi across signed configs (each pattern's pi split equally)
+  # Ex: if fixedPi = c(0.4, 0.1, 0.1, 0.4) then we weight h^l = (0,1), which is the third object in Hmat vector 
+  #with prior 0.05 (the third object in fixedPi vector) because there are 2 h^ls with the same pattern (i.e. (0,1) and (0, -1)).
+  expandedPi <- sapply(1:nrow(allHmat), function(i) {
+    pIdx <- patternIndices[i]
+    fixedPi[pIdx] / patternCounts[as.character(pIdx)]
+  })
+  
+  # Expand densities using pattern index
+  expandedDensMat <- sapply(1:nrow(allHmat), function(i) {
+    densMat[, patternIndices[i]]
+  })
+  
+  # Multiply by expanded priors
+  weightedDensMat <- sweep(expandedDensMat, 2, expandedPi, `*`)
+  
+  # Compute probability of Z
+  probZ <- rowSums(weightedDensMat)
+  
+  # Define null columns → any configuration with at least one 0
+  nullCols <- which(apply(allHmat, 1, function(x) any(x == 0)))
+  
+  # Compute probNull
+  probNull <- rowSums(weightedDensMat[, nullCols, drop=FALSE])
+  
+  # Local FDR
+  lfdrResults <- probNull / probZ
+  
+  # Return info
+  return(list(
+    fixedPi = fixedPi,         # fixed pi values used
+    fixedMu = fixedMu,         # fixed mu values used
+    lfdrResults = lfdrResults, # computed local false discovery rates
+    Hmat = Hmat,               # the configurations
+    probZ = probZ,             # total prob
+    probNull = probNull        # total null prob
+  ))
+}
+
+pi <- 0.5 # mixture weight for simulating +/- mu under the alt
+
+# Function to generate alt and null stats
+generate_alt_stats <- function(n, mu, pi, hl) {
+  K <- length(mu)
+  Z <- matrix(NA, nrow = n, ncol = K)
+  
+  for (j in 1:K) {
+    if (hl[j] == 0) {
+      Z[, j] <- rnorm(n, 0, 1)
+    } else {
+      sign_vec <- sample(c(-1, 1), n, replace = TRUE, prob = c(1 - pi, pi))
+      Z[, j] <- rnorm(n, mean = sign_vec * mu[j], sd = 1)
+    }
+  }
+  return(Z)
+}
+
+# Run settings
+fixedPi_3 <- c(0.9, 0.04, 0.03, 0.03)
+fixedPi_40 <- c(0.4, 0.1, 0.1, 0.4)
+fixedMu <- c(2,2)
+
+# FIG 4 (A)-(B):  3% TRUE PRIOR 
+set.seed(123)
+run_simulation_3 <- function(fixedMu, n_sim = 1000) {
+  fdp_vec <- numeric(n_sim)
+  power_vec <- numeric(n_sim)
+  
+  for (i in 1:n_sim) {
+    alt_1 <- generate_alt_stats(40, fixedMu, pi, hl = c(1, 0))
+    alt_2 <- generate_alt_stats(30, fixedMu, pi, hl = c(0, 1))
+    alt_3 <- generate_alt_stats(30, fixedMu, pi, hl = c(1, 1))
+    null_stats <- generate_alt_stats(900, fixedMu, pi, hl = c(0, 0))
+    testStats_new <- rbind(null_stats, alt_1, alt_2, alt_3)
+    true_labels <- c(rep(0, 900), rep(0, 40), rep(0, 30), rep(1, 30))  # 0 = null, 1 = alt
+    
+    fit_result_new <- symm_fit_ind_fixed(testStats_new, fixedMu, fixedPi_3)
+    lfdr <- fit_result_new$lfdrResults
+    
+    sorted_lfdr <- sort(lfdr)
+    cum_avg <- cumsum(sorted_lfdr) / seq_along(sorted_lfdr)
+    r <- max(which(cum_avg <= 0.1))
+    
+    if (r > 0) {
+      rejected_indices <- order(lfdr)[1:r]
+      num_fp <- sum(true_labels[rejected_indices] == 0) # false positives
+      num_tp <- sum(true_labels[rejected_indices] == 1) 
+      fdp_vec[i] <- num_fp / r
+      power_vec[i] <- num_tp / 30  # 30 alternatives
+    } else {
+      fdp_vec[i] <- 0
+      power_vec[i] <- 0
+    }
+  }
+  
+  list(mean_fdp = mean(fdp_vec),
+       power = mean(power_vec))
+}
+
+set.seed(123)
+run_simulation_40_pi3 <- function(fixedMu, n_sim = 1000) {
+  fdp_vec <- numeric(n_sim)
+  power_vec <- numeric(n_sim)
+  
+  for (i in 1:n_sim) {
+    alt_1 <- generate_alt_stats(100, fixedMu, pi, hl = c(1, 0))
+    alt_2 <- generate_alt_stats(100, fixedMu, pi, hl = c(0, 1))
+    alt_3 <- generate_alt_stats(400, fixedMu, pi, hl = c(1, 1))
+    null_stats <- generate_alt_stats(400, fixedMu, pi, hl = c(0, 0))
+    testStats_new <- rbind(null_stats, alt_1, alt_2, alt_3)
+    true_labels <- c(rep(0, 400), rep(0, 100), rep(0, 100), rep(1, 400))  # 0 = null, 1 = alt
+    
+    fit_result_new <- symm_fit_ind_fixed(testStats_new, fixedMu, fixedPi_3)
+    lfdr <- fit_result_new$lfdrResults
+    
+    sorted_lfdr <- sort(lfdr)
+    cum_avg <- cumsum(sorted_lfdr) / seq_along(sorted_lfdr)
+    r <- max(which(cum_avg <= 0.1))
+    
+    if (r > 0) {
+      rejected_indices <- order(lfdr)[1:r]
+      num_fp <- sum(true_labels[rejected_indices] == 0) # false positives
+      num_tp <- sum(true_labels[rejected_indices] == 1) 
+      fdp_vec[i] <- num_fp / r
+      power_vec[i] <- num_tp / 400  # 400 alternatives
+    } else {
+      fdp_vec[i] <- 0
+      power_vec[i] <- 0
+    }
+  }
+  
+  list(mean_fdp = mean(fdp_vec),
+       power = mean(power_vec))
+}
+
+set.seed(123)
+run_simulation_90_pi3 <- function(fixedMu, n_sim = 1000) {
+  fdp_vec <- numeric(n_sim)
+  power_vec <- numeric(n_sim)
+  
+  for (i in 1:n_sim) {
+    alt_1 <- generate_alt_stats(40, fixedMu, pi, hl = c(1, 0))
+    alt_2 <- generate_alt_stats(30, fixedMu, pi, hl = c(0, 1))
+    alt_3 <- generate_alt_stats(900, fixedMu, pi, hl = c(1, 1))
+    null_stats <- generate_alt_stats(30, fixedMu, pi, hl = c(0, 0))
+    testStats_new <- rbind(null_stats, alt_1, alt_2, alt_3)
+    true_labels <- c(rep(0, 30), rep(0, 30), rep(0, 40), rep(1, 900))  # 0 = null, 1 = alt, -1 = partial alt (ignore)
+    
+    fit_result_new <- symm_fit_ind_fixed(testStats_new, fixedMu, fixedPi_3)
+    lfdr <- fit_result_new$lfdrResults
+    
+    sorted_lfdr <- sort(lfdr)
+    cum_avg <- cumsum(sorted_lfdr) / seq_along(sorted_lfdr)
+    r <- max(which(cum_avg <= 0.1))
+    
+    if (r > 0) {
+      rejected_indices <- order(lfdr)[1:r]
+      num_fp <- sum(true_labels[rejected_indices] == 0) # false positives
+      num_tp <- sum(true_labels[rejected_indices] == 1) 
+      fdp_vec[i] <- num_fp / r
+      power_vec[i] <- num_tp / 900  # 900 alternatives
+    } else {
+      fdp_vec[i] <- 0
+      power_vec[i] <- 0
+    }
+  }
+  
+  list(mean_fdp = mean(fdp_vec),
+       power = mean(power_vec))
+}
+
+# FDP: 3% alt, 3% alt prior (true prior)
+mu_values <- seq(0, 8, by = 0.25)
+
+fdp_curve_3 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_3(fixedMu)$mean_fdp
+})
+
+# FDP: 90% alt, 3% alt prior
+fdp_curve_90_pi3 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_90_pi3(fixedMu)$mean_fdp
+})
+
+# FDP: 40% alt, 3% alt prior
+fdp_curve_40_pi3 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_40_pi3(fixedMu)$mean_fdp
+})
+
+# Power: 3% alt, 3% prior (true prior)
+power_curve_3 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_3(fixedMu)$power
+})
+
+# Power: 90% Alt, 3% Alt Prior
+power_curve_90_pi3 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_90_pi3(fixedMu)$power
+})
+
+# Power: 40% alt, 3% Alt Prior
+fixedPi_40_pi3 <- c(0.4, 0.1, 0.1, 0.4)
+power_curve_40_pi3 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_40_pi3(fixedMu)$power
+})
+
+# Put FDP data into long format
+df3 <- data.frame(
+  mu = rep(mu_values, 3),
+  fdp = c(fdp_curve_3, fdp_curve_40_pi3, fdp_curve_90_pi3),
+  group = rep(c("True Alternative", "40% Alternative", "90% Alternative"),
+              each = length(mu_values))
+)
+
+# Put Power data into long format
+df_power <- data.frame(
+  mu = rep(mu_values, 3),
+  power = c(power_curve_3, power_curve_40_pi3, power_curve_90_pi3),
+  group = rep(c("True Alternative", "40% Alternative", "90% Alternative"),
+              each = length(mu_values))
+)
+
+# Plot FDP Curve (fig 4a)
+ggplot(df3, aes(x = mu, y = fdp, linetype = group, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.1, linetype = "dashed") +
+  labs(x = "Effect Size (mu)", y = "FDP") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_blank()
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_linetype_manual(values = c("dotdash", "dashed", "solid"))
+
+
+# Plot Power curve (fig 4b)
+ggplot(df_power, aes(x = mu, y = power, linetype = group, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.8, linetype = "dashed") +
+  labs(x = "Effect Size (mu)", y = "Power") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_blank()
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_linetype_manual(values = c("dotdash", "dashed", "solid"))
+
+
+# FIG 4 (C)-(D): 40% TRUE PRIOR
+set.seed(123)
+run_simulation_40 <- function(fixedMu, n_sim = 1000) {
+  fdp_vec <- numeric(n_sim)
+  power_vec <- numeric(n_sim)
+  
+  for (i in 1:n_sim) {
+    alt_1 <- generate_alt_stats(100, fixedMu, pi, hl = c(1, 0))
+    alt_2 <- generate_alt_stats(100, fixedMu, pi, hl = c(0, 1))
+    alt_3 <- generate_alt_stats(400, fixedMu, pi, hl = c(1, 1))
+    null_stats <- generate_alt_stats(400, fixedMu, pi, hl = c(0, 0))
+    testStats_new <- rbind(null_stats, alt_1, alt_2, alt_3)
+    true_labels <- c(rep(0, 400), rep(0, 100), rep(0, 100), rep(1, 400))  # 0 = null, 1 = alt
+    
+    fit_result_new <- symm_fit_ind_fixed(testStats_new, fixedMu, fixedPi_40)
+    lfdr <- fit_result_new$lfdrResults
+    
+    sorted_lfdr <- sort(lfdr)
+    cum_avg <- cumsum(sorted_lfdr) / seq_along(sorted_lfdr)
+    r <- max(which(cum_avg <= 0.1))
+    
+    if (r > 0) {
+      rejected_indices <- order(lfdr)[1:r]
+      num_fp <- sum(true_labels[rejected_indices] == 0) # false positives
+      num_tp <- sum(true_labels[rejected_indices] == 1) 
+      fdp_vec[i] <- num_fp / r
+      power_vec[i] <- num_tp / 400  # 400 alternatives
+    } else {
+      fdp_vec[i] <- 0
+      power_vec[i] <- 0
+    }
+  }
+  
+  list(mean_fdp = mean(fdp_vec),
+       power = mean(power_vec))
+}
+
+set.seed(123)
+run_simulation_3_pi40 <- function(fixedMu, n_sim = 1000) {
+  fdp_vec <- numeric(n_sim)
+  power_vec <- numeric(n_sim)
+  
+  for (i in 1:n_sim) {
+    alt_1 <- generate_alt_stats(40, fixedMu, pi, hl = c(1, 0))
+    alt_2 <- generate_alt_stats(30, fixedMu, pi, hl = c(0, 1))
+    alt_3 <- generate_alt_stats(30, fixedMu, pi, hl = c(1, 1))
+    null_stats <- generate_alt_stats(900, fixedMu, pi, hl = c(0, 0))
+    testStats_new <- rbind(null_stats, alt_1, alt_2, alt_3)
+    true_labels <- c(rep(0, 900), rep(0, 40), rep(0, 30), rep(1, 30))  # 0 = null, 1 = alt
+    
+    fit_result_new <- symm_fit_ind_fixed(testStats_new, fixedMu, fixedPi_40)
+    lfdr <- fit_result_new$lfdrResults
+    
+    sorted_lfdr <- sort(lfdr)
+    cum_avg <- cumsum(sorted_lfdr) / seq_along(sorted_lfdr)
+    r <- max(which(cum_avg <= 0.1))
+    
+    if (r > 0) {
+      rejected_indices <- order(lfdr)[1:r]
+      num_fp <- sum(true_labels[rejected_indices] == 0) # false positives
+      num_tp <- sum(true_labels[rejected_indices] == 1) 
+      fdp_vec[i] <- num_fp / r
+      power_vec[i] <- num_tp / 30  # 30 alternatives
+    } else {
+      fdp_vec[i] <- 0
+      power_vec[i] <- 0
+    }
+  }
+  
+  list(mean_fdp = mean(fdp_vec),
+       power = mean(power_vec))
+}
+
+set.seed(123)
+run_simulation_90_pi40 <- function(fixedMu, n_sim = 1000) {
+  fdp_vec <- numeric(n_sim)
+  power_vec <- numeric(n_sim)
+  
+  for (i in 1:n_sim) {
+    alt_1 <- generate_alt_stats(40, fixedMu, pi, hl = c(1, 0))
+    alt_2 <- generate_alt_stats(30, fixedMu, pi, hl = c(0, 1))
+    alt_3 <- generate_alt_stats(900, fixedMu, pi, hl = c(1, 1))
+    null_stats <- generate_alt_stats(30, fixedMu, pi, hl = c(0, 0))
+    testStats_new <- rbind(null_stats, alt_1, alt_2, alt_3)
+    true_labels <- c(rep(0, 30), rep(0, 30), rep(0, 40), rep(1, 900))  # 0 = null, 1 = alt, -1 = partial alt (ignore)
+    
+    fit_result_new <- symm_fit_ind_fixed(testStats_new, fixedMu, fixedPi_40)
+    lfdr <- fit_result_new$lfdrResults
+    
+    sorted_lfdr <- sort(lfdr)
+    cum_avg <- cumsum(sorted_lfdr) / seq_along(sorted_lfdr)
+    r <- max(which(cum_avg <= 0.1))
+    
+    if (r > 0) {
+      rejected_indices <- order(lfdr)[1:r]
+      num_fp <- sum(true_labels[rejected_indices] == 0) # false positives
+      num_tp <- sum(true_labels[rejected_indices] == 1) 
+      fdp_vec[i] <- num_fp / r
+      power_vec[i] <- num_tp / 900  # 900 alternatives
+    } else {
+      fdp_vec[i] <- 0
+      power_vec[i] <- 0
+    }
+  }
+  
+  list(mean_fdp = mean(fdp_vec),
+       power = mean(power_vec))
+}
+
+# FDP: 40% alt, 40% alt prior (true prior)
+mu_values <- seq(0, 8, by = 0.25)
+
+fdp_curve_40 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_40(fixedMu)$mean_fdp
+})
+
+# FDP: 3% alt, 40% alt prior
+fdp_curve_3_pi40 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_3_pi40(fixedMu)$mean_fdp
+})
+
+# FDP: 90% alt, 40% alt prior
+fdp_curve_90_pi40 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_90_pi40(fixedMu)$mean_fdp
+})
+
+# Power: 40% Alt, 40% Prior
+power_curve_40 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_40(fixedMu)$power
+})
+
+# Power: 3% Alt, 40% Alt Prior
+power_curve_3_pi40 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_3_pi40(fixedMu)$power
+})
+
+# Power: 90% alt, 40% Alt Prior
+power_curve_90_pi40 <- sapply(mu_values, function(mu_val) {
+  fixedMu <- rep(mu_val, 2)
+  run_simulation_90_pi40(fixedMu)$power
+})
+
+
+# Put FDP data into long format
+df40 <- data.frame(
+  mu = rep(mu_values, 3),
+  fdp = c(fdp_curve_3_pi40, fdp_curve_40, fdp_curve_90_pi40),
+  group = rep(c("3% Alternative", "True Alternative", "90% Alternative"),
+              each = length(mu_values))
+)
+
+# Put Power data into long format
+df_power_40 <- data.frame(
+  mu = rep(mu_values, 3),
+  power = c(power_curve_3_pi40, power_curve_40, power_curve_90_pi40),
+  group = rep(c("3% Alternative", "True Alternative", "90% Alternative"),
+              each = length(mu_values))
+)
+
+# Plot FDP Curve (Fig 4c)
+ggplot(df40, aes(x = mu, y = fdp, linetype = group, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.1, linetype = "dashed") +
+  labs(x = "Effect Size (mu)", y = "FDP") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_blank()
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_linetype_manual(values = c("dashed", "dotdash", "solid"))
+
+# Plot Power Curve (fig 4d)
+ggplot(df_power_40, aes(x = mu, y = power, linetype = group, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.8, linetype = "dashed") +
+  labs(x = "Effect Size (mu)", y = "Power") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_blank()
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_linetype_manual(values = c("dashed", "dotdash", "solid"))
+
+
+###########################################################################
+###                                                                     ###
+###                Example Replication Analysis Code                    ###             
+###                           (Section 4)                               ###
+###                                                                     ###
+###########################################################################
+
+# Section 4.1 (Worked Code) ----------------------------------------------------
+
+# Install packages and load Libraries
+
+# 1. Install CRAN packages
+# install.packages(c("dplyr", "remotes", "readr"))
+
+# 2. Install Bioconductor manager for genome liftover
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+# install.packages("BiocManager")
+
+# 3. Install Bioconductor packages
+# BiocManager::install(c("rtracklayer", "GenomicRanges"))
+
+# 4. Install csmGmm from GitHub
+# remotes::install_github("ryansun/csmGmm")
+
+# 5. Load libraries
+library(dplyr)
+library(readr)
+library(csmGmm)
+library(rtracklayer)
+library(GenomicRanges)
+
+# Set working directory 
+getwd()
+setwd("/Users/ekim14/Downloads")
+
+# 6. Read data
+iCOGS <- read_tsv("GCST010098.tsv",
+                  col_select = c(
+                    variant_id,
+                    chromosome,
+                    base_pair_location,
+                    beta,
+                    standard_error,
+                    effect_allele,
+                    other_allele,
+                    p_value
+                  ),
+                  progress = FALSE)    # build 37 breast cancer (iCOGS array)
+
+
+VA_MVP <- read_tsv("GCST90475586.tsv.gz",
+                   col_select = c(
+                     chromosome,
+                     base_pair_location,
+                     odds_ratio,
+                     p_value,
+                     effect_allele,
+                     other_allele,
+                     rsid
+                   ),
+                   progress = FALSE)  # build 38 breast cancer (subset of VA MVP)
+
+
+
+# 7. Liftover on VA_MVP dataset: build38 -> build37 
+chain_38to37 <- import.chain("hg38ToHg19.over.chain")
+
+
+VA_MVP_liftover <- {
+  keep0 <- !is.na(VA_MVP$base_pair_location) # get rid of NAs
+  df <- VA_MVP[keep0, ]
+  rm(VA_MVP); gc()
+  
+  gr <- GRanges(
+    seqnames = paste0("chr", df$chromosome),
+    ranges   = IRanges(
+      start = df$base_pair_location,
+      end   = df$base_pair_location
+    )
+  )
+  
+  lifted <- liftOver(gr, chain_38to37)
+  
+  # keep only uniquely mapped variants
+  keep1 <- elementNROWS(lifted) == 1
+  lifted <- lifted[keep1]
+  
+  df <- df[keep1, ]
+  
+  df$chromosome <- gsub(
+    "^chr", "", as.character(seqnames(unlist(lifted)))
+  )
+  df$base_pair_location <- start(unlist(lifted))
+  
+  df
+}
+
+
+# 8. Clean iCOGS  
+iCOGS_new <- iCOGS %>%
+  mutate(
+    Z_iCOGS = beta/standard_error
+  ) %>%
+  filter(!is.na(Z_iCOGS)) %>%
+  distinct(chromosome, base_pair_location, .keep_all = TRUE)
+
+rm(iCOGS)
+gc()
+
+
+# 9. Clean VA MVP
+VA_MVP_new <- VA_MVP_liftover %>% 
+  mutate(chromosome = as.numeric(chromosome),
+         beta = log(odds_ratio), 
+         Z = sign(beta) * qnorm(1 - p_value / 2), 
+         std_error = abs(beta / Z), as.numeric(std_error), 
+         Z_MVP = beta/std_error, 
+         variant_id = paste(chromosome, base_pair_location, other_allele, effect_allele, sep="_") ) %>% 
+  filter(!is.na(Z_MVP)) %>%
+  distinct(chromosome, base_pair_location, .keep_all = TRUE)
+
+rm(VA_MVP_liftover, keep0, keep1, df)
+gc()
+
+
+# 10. Merge datasets on chromosome and base pair location
+merged_data <- iCOGS_new %>%
+  inner_join(VA_MVP_new, 
+             by = c("chromosome", "base_pair_location"),
+             suffix = c("_iCOGS", "_MVP"))
+
+## Effect allele and other allele switched is still the same SNP
+merged_data <- merged_data %>%
+  mutate(
+    flip = case_when(
+      effect_allele_iCOGS == effect_allele_MVP &
+        other_allele_iCOGS  == other_allele_MVP ~ FALSE,
+      
+      effect_allele_iCOGS == other_allele_MVP &
+        other_allele_iCOGS  == effect_allele_MVP ~ TRUE,
+      
+      TRUE ~ NA
+    )
+  ) %>%
+  filter(!is.na(flip))
+
+## Flip Z scores when effect_allele and other_allele order are switched (using iCOGS as fixed Z-score direction)
+merged_data <- merged_data %>%
+  mutate(
+    Z_MVP_aligned = ifelse(flip, -Z_MVP, Z_MVP)
+  )
+
+# 11. Build J*K testStats matrix
+testStats <- cbind(merged_data$Z_MVP_aligned, merged_data$Z_iCOGS)
+
+
+## cap Z-scores at ±8.1 -> so EM doesn't blow up outliers
+testDat <- as.matrix(testStats)
+testDat[testDat > 8.1] <- 8.1
+testDat[testDat < -8.1] <- -8.1
+
+
+# 12. Set initial mean and prior parameters as recommended or based on your own knowledge
+initPiList <- list(c(0.95), c(0.1, 0.05), c(0.1, 0.05), c(0.02)) 
+initMuList <- list(
+  matrix(data=0, nrow=2, ncol=1),
+  matrix(data=c(0, 5, 0, 5), nrow=2), #(0,1)
+  matrix(data=c(5, 0, 5, 0), nrow=2), #(1,0)
+  matrix(data=c(8, 8), nrow=2)  
+)                                                       
+
+# 13. Run csmGmm
+res <- symm_fit_ind_EM(testStats = testDat, initMuList = initMuList, initPiList = initPiList, sameDirAlt = TRUE, eps = 10^(-5), checkpoint = TRUE)
+
+
+# 14. Sort lfdrResults and compute cumulative average and map back to original SNPs
+sorted_idx <- order(res$lfdrResults)
+cum_avg <- cumsum(res$lfdrResults[sorted_idx]) / seq_along(res$lfdrResults)
+cum_avg_original <- numeric(length(res$lfdrResults))
+cum_avg_original[sorted_idx] <- cum_avg
+
+
+rep_analysis <- merged_data %>%
+  mutate(
+    lfdrResults = res$lfdrResults,
+    cum_avg = cum_avg_original)
+head(rep_analysis)
+View(rep_analysis)
+
+# 15. Find replicated SNPs
+sig_snps_info <- rep_analysis %>%
+  filter(cum_avg < 0.1) %>%
+  arrange(lfdrResults) %>%
+  select(variant_id_iCOGS, rsid_MVP, chromosome, lfdrResults, cum_avg) 
+
+sig_snps_info
+write.csv(sig_snps_info, "Significant_SNPS.csv", row.names = FALSE)
+
+############################################################################
+###                                                                      ###
+###               Example Replication Analysis Figure Code               ###
+###                             (Section 4)                              ###
+###                                                                      ###
+############################################################################
+
+
+# Install packages and load libraries ------------------------------------------
+
+# install.packages(c("ggplot2", "cowplot", "tidyr", "tibble", "dplyr"))
+library(ggplot2)
+library(cowplot)
+library(tidyr)
+library(dplyr)
+
+# Section 4: Figure 5 (Manhattan Plot) -----------------------------------------
+
+## for colors
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+## plot manhattan function
+plotManhattan <- function(plotRes, chrCounts, colValues, shapeValues, ylimits, legName) {
+  # arrange data by chromosome
+  plotRes <- plotRes %>% arrange(Chr)
+  uniqueChrs <- sort(unique(plotRes$Chr))
+  
+  chrOffsets <- cumsum(chrCounts)
+  truePos <- rep(NA, nrow(plotRes))
+  counter <- 1
+  for (chr_it in 1:length(uniqueChrs)) {
+    tempChr <- uniqueChrs[chr_it]
+    tempDat <- plotRes %>% filter(Chr == tempChr)
+    # offset = sum of all previous chromosomes' max positions
+    offsetVal <- ifelse(tempChr == 1, 0, chrOffsets[tempChr - 1])
+    truePos[counter:(counter + nrow(tempDat) - 1)] <- offsetVal + tempDat$BP
+    counter <- counter + nrow(tempDat)
+  }
+  
+  
+  # x-axis ticks at the end of each chromosome
+  xBreaks <- chrOffsets[1:22]  
+  xBreaksLabs <- ifelse((1:22) %% 2 == 0, "", as.character(1:22))
+  
+  plotDat <- plotRes %>% mutate(truePos = truePos)
+  
+  returnPlot <- ggplot(plotDat, aes(x=truePos, y=-log10(newLfdr), color=as.factor(cat), shape=as.factor(cat))) +
+    geom_point() +
+    xlab("Chromosome") + ylab("-log10(lfdr)") +
+    scale_color_manual(name=legName, values=colValues) +
+    scale_shape_manual(name=legName, values=shapeValues) +
+    scale_x_continuous(name="Chr", breaks=xBreaks, labels=xBreaksLabs) +
+    ylim(ylimits) +
+    theme_cowplot() +
+    theme(axis.text=element_text(size=18), axis.title=element_text(size=18),
+          legend.title=element_text(size=18), legend.text=element_text(size=18)) +
+    guides(colour = guide_legend(override.aes = list(size=4)))
+  
+  
+  return(returnPlot)
+}
+
+
+manDataTwo <- rep_analysis[, c("variant_id_iCOGS", "chromosome", "base_pair_location", "lfdrResults")]
+manDataTwo$cat <- "iCOGS, VA MVP"
+manDataTwo$Chr <- as.numeric(manDataTwo$chromosome)
+manDataTwo$BP <- as.numeric(manDataTwo$base_pair_location)
+manDataTwo <- manDataTwo[order(manDataTwo$lfdrResults), ]
+manDataTwo <- manDataTwo[!duplicated(manDataTwo$variant_id_iCOGS), ]
+manDataTwo$newLfdr <- manDataTwo$lfdrResults
+
+
+chrCounts <- manDataTwo %>%
+  group_by(Chr) %>%
+  summarise(chrLength = max(BP, na.rm = TRUE)) %>%
+  arrange(Chr) %>%
+  pull(chrLength)
+
+chrOffsets <- cumsum(chrCounts)
+
+manPlotTwo <- plotManhattan(plotRes = manDataTwo, chrCounts,
+                            colValues = gg_color_hue(1), shapeValues=c(16), ylimits=c(0, 11), legName="")
+
+
+manPlotTwo
+
+# Section 4: Fig 6 (Z-score Plot) ----------------------------------------------
+
+biv_data <- merged_data_1 %>%
+  select(Z_iCOGS, Z_MVP_aligned) 
+
+z_plot <- ggplot(biv_data, aes(x = Z_iCOGS, y = Z_MVP_aligned)) +
+  geom_point(color = "red", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  xlab("Z-score (iCOGS)") +
+  ylab("Z-score (VA MVP)") +
+  theme_bw(base_size = 16)
+
+z_plot
+
+# Section 4: Fig 7 (Miami Plot) ------------------------------------------------
+
+iCOGS_miami <- iCOGS_new %>%
+  transmute(
+    Chr = as.numeric(chromosome),
+    BP  = as.numeric(base_pair_location),
+    logp = -log10(p_value)
+  ) %>%
+  filter(!is.na(Chr), Chr >= 1, Chr <= 22) 
+
+rm(iCOGS_new)
+
+VA_MVP_miami <- VA_MVP_new %>%
+  transmute(
+    Chr = as.numeric(chromosome),
+    BP  = as.numeric(base_pair_location),
+    logp = -log10(p_value)
+  ) %>%
+  filter(!is.na(Chr), Chr >= 1, Chr <= 22)
+
+rm(VA_MVP_new)
+
+chr_table <- bind_rows(
+  iCOGS_miami %>% select(Chr, BP),
+  VA_MVP_miami %>% select(Chr, BP)
+) %>%
+  group_by(Chr) %>%
+  summarise(chrLength = max(BP, na.rm = TRUE)) %>%
+  arrange(Chr)
+
+chrOffsets <- cumsum(chr_table$chrLength)
+names(chrOffsets) <- chr_table$Chr
+
+add_true_pos <- function(df, chrOffsets) {
+  df %>%
+    arrange(Chr, BP) %>%
+    mutate(
+      truePos = BP + ifelse(Chr == 1, 0, chrOffsets[as.character(Chr - 1)])
+    )
+}
+
+iCOGS_miami <- add_true_pos(iCOGS_miami, chrOffsets)
+VA_MVP_miami <- add_true_pos(VA_MVP_miami, chrOffsets)
+
+xBreaks <- chrOffsets[as.character(1:22)]
+xBreaksLabs <- ifelse((1:22) %% 2 == 0, "", as.character(1:22))
+
+miami_plot <- ggplot() +
+  # Top: iCOGS
+  geom_point(
+    data = iCOGS_miami,
+    aes(x = truePos, y = logp),
+    color = ifelse(iCOGS_miami$Chr %% 2 == 0, "grey70", "blue"),
+    alpha = 0.7,
+    size = 0.8
+  ) +
+  # Bottom: VA MVP
+  geom_point(
+    data = VA_MVP_miami,
+    aes(x = truePos, y = -logp),
+    color = ifelse(VA_MVP_miami$Chr %% 2 == 0, "grey70", "red"),
+    alpha = 0.7,
+    size = 0.8
+  ) +
+  scale_x_continuous(
+    name = "Chromosome",
+    breaks = xBreaks,
+    labels = xBreaksLabs
+  ) +
+  scale_y_continuous(
+    name = "-log10(p-value)",
+    limits = c(-30, 80),
+    breaks = seq(-30, 80, 10)
+  ) +
+  theme_cowplot() +
+  theme(
+    axis.text  = element_text(size = 16),
+    axis.title = element_text(size = 16)
+  )
+
+## Save plot
+ggsave(
+  filename = "miami_plot.png",
+  plot = miami_plot,
+  width = 14,
+  height = 6,
+  dpi = 300
+)
+
+
